@@ -1,0 +1,29 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+.venv/
+env/
+venv/
+noisy_seg_env/
+
+# OS / editor
+.DS_Store
+*.swp
+*.swo
+
+# Project outputs
+results/
+data/
+data_preprop/
+data_preproc/
+data/labels/
+data/images/
+model_script/**/history.json
+model_script/**/best.json
+
+# Checkpoints / logs
+*.log
+*.ckpt
+*.pth
