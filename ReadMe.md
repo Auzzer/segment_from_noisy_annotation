@@ -7,7 +7,7 @@ A practical pipeline for training, evaluating, and deploying 3D U-Net models (si
 - GPU-accelerated training and inference by default
 - Safe checkpoint handling and resume support
 - Sliding‑window inference with configurable patch size and overlap
-- Built‑in metrics (Dice, clDice) and plotting utilities
+- Built‑in metrics (Dice, clDice) and plotting utilities (can be skipped for faster export-only runs)
 
 ## Project Layout
 - `utils/` — reusable building blocks (`dataset.py`, `losses.py`, `unet_model.py`)
@@ -50,7 +50,7 @@ Generate splits (optional, if you don’t have them yet):
    ```
    ./noisy_seg_env/bin/python -m model_script.train.check_progress
    ```
-3. Run prediction (test list is used by the script):
+3. Run prediction (uses both train/test lists by default; outputs go to `./results/predictions_ensemble` and `./data/unet_prediction/ensemble`):
    ```
    ./scripts/run_ensemble_prediction.sh
    ```
@@ -81,7 +81,7 @@ Generate splits (optional, if you don’t have them yet):
 - Safety: When trained models are detected, you’ll be asked before overwriting. Use `--resume` to continue without prompts.
 
 ## Prediction (Ensemble)
-- Standard run:
+- Standard run (uses train and test lists together):
   ```
   ./scripts/run_ensemble_prediction.sh
   ```
@@ -89,8 +89,15 @@ Generate splits (optional, if you don’t have them yet):
   ```
   ./scripts/run_ensemble_prediction.sh --resume
   ```
-- Optional fusion: `--fusion_method staple` to combine per-model masks via SimpleITK STAPLE (defaults to probability mean; requires `SimpleITK` installed).
-- Useful toggles (via script/env): patch size, overlap, `PATCH_BATCH_SIZE`, and AMP for memory/perf.
+- Output locations:
+  - Ensemble predictions (binarized by default): `./data/unet_prediction/ensemble/pred_XXX.nii.gz`
+  - Main run output dir (always written): `./results/predictions_ensemble/pred_XXX.nii.gz`
+- Useful toggles (via script/env or CLI):
+  - `BINARIZE_SAVED_OUTPUTS=true|false` (`--binarize_saved_outputs`) to save labels vs probabilities
+  - `SAVE_PER_MODEL_PREDS=true|false` (`--save_per_model_preds`) and `--per_model_output_root` to also save per-model outputs
+  - `SKIP_METRICS=true` (`--skip_metrics`) to skip Dice/clDice computation and CSV logging when you only need exports
+  - Patch size, overlap, `PATCH_BATCH_SIZE`, and AMP for memory/perf
+- Fusion: `--fusion_method staple` to combine per-model masks via SimpleITK STAPLE (defaults to probability mean; requires `SimpleITK` installed).
 
 ## Checkpoints & Resuming
 - Checkpoints saved per model (e.g., `latest.pth`, `best.pth`).
