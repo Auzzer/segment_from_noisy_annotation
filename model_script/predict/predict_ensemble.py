@@ -313,8 +313,8 @@ def predict_with_ensemble(
     return prediction, model_predictions
 
 
-def calculate_metrics(pred, target, threshold=0.5, target_skeleton=None):
-    """Calculate Dice and clDice scores using MONAI Dice and custom clDice."""
+def calculate_metrics(pred, target, threshold=0.5, target_skeleton=None, compute_cldice=True):
+    """Calculate Dice and optional clDice scores using MONAI Dice and custom clDice."""
     pred_tensor = torch.from_numpy(pred).unsqueeze(0).unsqueeze(0)
     target_tensor = torch.from_numpy(target).unsqueeze(0).unsqueeze(0)
     
@@ -326,14 +326,17 @@ def calculate_metrics(pred, target, threshold=0.5, target_skeleton=None):
     )
     dice = torch.nan_to_num(dice_tensor, nan=1.0).mean().item()
     
-    pred_binary_np = pred_binary.cpu().numpy().astype(bool)[0, 0]
-    target_binary_np = target_binary.cpu().numpy().astype(bool)[0, 0]
+    cldice = None
+    if compute_cldice:
+        pred_binary_np = pred_binary.cpu().numpy().astype(bool)[0, 0]
+        target_binary_np = target_binary.cpu().numpy().astype(bool)[0, 0]
+        
+        cldice, target_skeleton = compute_cldice_score(
+            pred_binary_np, target_binary_np, target_skeleton=target_skeleton
+        )
+        cldice = float(cldice)
     
-    cldice, target_skeleton = compute_cldice_score(
-        pred_binary_np, target_binary_np, target_skeleton=target_skeleton
-    )
-    
-    return float(dice), float(cldice), target_skeleton
+    return float(dice), cldice, target_skeleton
 
 
 def predict_on_dataset(args):
@@ -361,9 +364,33 @@ def predict_on_dataset(args):
         print("Error: No models loaded!")
         return
     
+    compute_metrics = not args.skip_metrics
+    if args.skip_metrics and args.resume:
+        print("Resume flag ignored because metrics are skipped; all images will be processed.")
+    
+    def prepare_for_saving(volume: np.ndarray) -> np.ndarray:
+        """Optionally binarize prediction before writing to disk."""
+        if args.binarize_saved_outputs:
+            return (volume > args.threshold).astype(np.uint8)
+        return volume
+    
     # Create output directory
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    ensemble_output_root = None
+    if args.ensemble_output_root:
+        ensemble_output_root = Path(args.ensemble_output_root)
+        ensemble_output_root.mkdir(parents=True, exist_ok=True)
+        print(f"Ensemble predictions will also be saved under: {ensemble_output_root}")
+    per_model_output_root = None
+    if args.save_per_model_preds:
+        per_model_output_root = (
+            Path(args.per_model_output_root)
+            if args.per_model_output_root is not None
+            else output_dir / 'per_model'
+        )
+        per_model_output_root.mkdir(parents=True, exist_ok=True)
+        print(f"Per-model predictions will be saved under: {per_model_output_root}")
     
     # Get list of images to process
     images_dir = Path(args.data_dir) / 'images'
@@ -371,8 +398,15 @@ def predict_on_dataset(args):
     
     image_files = sorted(list(images_dir.glob('*.nii.gz')))
     
-    if args.image_list:
-        allowed_ids = load_image_id_list(Path(args.image_list))
+    image_list_paths = [Path(p) for p in args.image_list] if args.image_list else []
+    if image_list_paths:
+        allowed_ids = set()
+        for list_path in image_list_paths:
+            if not list_path.exists():
+                print(f"Warning: list file not found: {list_path}")
+                continue
+            ids = load_image_id_list(list_path)
+            allowed_ids |= ids
         filtered = []
         for img in image_files:
             normalized = normalize_image_id(img.stem)
@@ -384,18 +418,21 @@ def predict_on_dataset(args):
             for miss in sorted(missing):
                 print(f"  - {miss}")
         image_files = filtered
-        print(f"\nFiltered to {len(image_files)} images from list: {args.image_list}")
+        joined_lists = ", ".join(str(p) for p in image_list_paths)
+        print(f"\nFiltered to {len(image_files)} images from lists: {joined_lists}")
     else:
         print(f"\nFound {len(image_files)} images to process")
     
     # Prepare metrics containers and CSV writer
-    ensemble_metrics = {"dice": [], "cldice": []}
-    per_model_metrics = [{"dice": [], "cldice": []} for _ in models]
-    csv_path = output_dir / 'per_image_metrics.csv'
+    ensemble_metrics = {"dice": [], "cldice": []} if compute_metrics else None
+    per_model_metrics = [{"dice": []} for _ in models] if compute_metrics else None
+    csv_path = output_dir / 'per_image_metrics.csv' if compute_metrics else None
     
     # Track processed images for resume functionality
     processed_images = set()
-    if args.resume and csv_path.exists():
+    csv_mode = 'w'
+    write_header = True
+    if compute_metrics and args.resume and csv_path.exists():
         print(f"Resume mode enabled. Loading existing results from {csv_path}")
         with open(csv_path, 'r') as csvfile:
             reader = csv.reader(csvfile)
@@ -405,28 +442,29 @@ def predict_on_dataset(args):
                     processed_images.add(row[0])  # image_id is first column
         print(f"Found {len(processed_images)} already processed images. Skipping them...")
         print()
+        csv_mode = 'a'
+        write_header = False
     
-    # Determine write mode based on resume flag
-    csv_mode = 'a' if (args.resume and csv_path.exists()) else 'w'
-    write_header = not (args.resume and csv_path.exists())
-    
-    with open(csv_path, csv_mode, newline='') as csvfile:
-        writer = csv.writer(csvfile)
+    writer = None
+    csvfile_handle = None
+    if compute_metrics:
+        csvfile_handle = open(csv_path, csv_mode, newline='')
+        writer = csv.writer(csvfile_handle)
         if write_header:
             header = (
                 ['image_id', 'ensemble_dice', 'ensemble_cldice'] +
-                [f'model_{i}_dice' for i in range(len(models))] +
-                [f'model_{i}_cldice' for i in range(len(models))]
+                [f'model_{i}_dice' for i in range(len(models))]
             )
             writer.writerow(header)
-        
+    
+    try:
         for img_file in tqdm(image_files, desc="Processing images"):
             # Extract image number
             img_num = img_file.stem.split('.')[0].split('_')[1]
             img_id = f"image_{img_num}"
             
             # Skip if already processed (resume mode)
-            if img_id in processed_images:
+            if compute_metrics and img_id in processed_images:
                 continue
             
             # Load image
@@ -447,18 +485,27 @@ def predict_on_dataset(args):
             )
             
             # Save prediction (ensemble)
-            pred_nifti = nib.Nifti1Image(prediction, img_nifti.affine, img_nifti.header)
+            pred_to_save = prepare_for_saving(prediction)
+            pred_nifti = nib.Nifti1Image(pred_to_save, img_nifti.affine, img_nifti.header)
             pred_path = output_dir / f'pred_{img_num}.nii.gz'
             nib.save(pred_nifti, str(pred_path))
+            if ensemble_output_root is not None:
+                ensemble_path = ensemble_output_root / f'pred_{img_num}.nii.gz'
+                nib.save(pred_nifti, str(ensemble_path))
             
             # Optionally save per-model predictions
             if args.save_per_model_preds:
+                base_dir = per_model_output_root if per_model_output_root is not None else output_dir / 'per_model'
                 for m_idx, m_pred in enumerate(model_predictions):
-                    m_dir = output_dir / 'per_model' / f'model_{m_idx}'
+                    m_dir = base_dir / f'model_{m_idx}'
                     m_dir.mkdir(parents=True, exist_ok=True)
                     m_path = m_dir / f'pred_{img_num}.nii.gz'
-                    m_nifti = nib.Nifti1Image(m_pred, img_nifti.affine, img_nifti.header)
+                    m_pred_to_save = prepare_for_saving(m_pred)
+                    m_nifti = nib.Nifti1Image(m_pred_to_save, img_nifti.affine, img_nifti.header)
                     nib.save(m_nifti, str(m_path))
+            
+            if not compute_metrics:
+                continue
             
             # Calculate Dice score if label exists
             label_file = labels_dir / f'label_{img_num}.nii.gz'
@@ -479,28 +526,27 @@ def predict_on_dataset(args):
                 
                 row = [img_id, ensemble_dice, ensemble_cldice]
                 model_dice_vals = []
-                model_cldice_vals = []
                 for model_idx, model_pred in enumerate(model_predictions):
-                    model_dice, model_cldice, _ = calculate_metrics(
+                    model_dice, _, _ = calculate_metrics(
                         model_pred, label,
                         threshold=args.threshold,
-                        target_skeleton=label_skeleton
+                        target_skeleton=None,
+                        compute_cldice=False
                     )
                     per_model_metrics[model_idx]["dice"].append(model_dice)
-                    per_model_metrics[model_idx]["cldice"].append(model_cldice)
                     model_dice_vals.append(model_dice)
-                    model_cldice_vals.append(model_cldice)
                     print(
-                        f"    Model {model_idx}: Dice = {model_dice:.4f}, "
-                        f"clDice = {model_cldice:.4f}"
+                        f"    Model {model_idx}: Dice = {model_dice:.4f}"
                     )
                 row.extend(model_dice_vals)
-                row.extend(model_cldice_vals)
                 writer.writerow(row)
-                csvfile.flush()
+                csvfile_handle.flush()
+    finally:
+        if csvfile_handle is not None:
+            csvfile_handle.close()
     
     # Print summary
-    if ensemble_metrics["dice"]:
+    if compute_metrics and ensemble_metrics["dice"]:
         print("\n" + "="*80)
         print("PREDICTION SUMMARY")
         print("="*80)
@@ -525,10 +571,6 @@ def predict_on_dataset(args):
                 model_dice_mean = np.mean(metrics["dice"])
                 model_dice_std = np.std(metrics["dice"])
                 msg = f"  Model {model_idx}: Dice {model_dice_mean:.4f} ± {model_dice_std:.4f}"
-                if metrics["cldice"]:
-                    model_cldice_mean = np.mean(metrics["cldice"])
-                    model_cldice_std = np.std(metrics["cldice"])
-                    msg += f", clDice {model_cldice_mean:.4f} ± {model_cldice_std:.4f}"
                 print(msg)
             else:
                 print(f"  Model {model_idx}: No labels available for evaluation")
@@ -563,21 +605,14 @@ def predict_on_dataset(args):
         if ensemble_metrics["cldice"]:
             cldice_mean = np.mean(ensemble_metrics["cldice"])
             cldice_std = np.std(ensemble_metrics["cldice"])
-            cldice_values = [
-                np.mean(metrics["cldice"]) if metrics["cldice"] else 0.0
-                for metrics in per_model_metrics
-            ] + [cldice_mean]
-            cldice_errors = [
-                np.std(metrics["cldice"]) if len(metrics["cldice"]) > 1 else 0.0
-                for metrics in per_model_metrics
-            ] + ([cldice_std] if len(ensemble_metrics["cldice"]) > 1 else [0.0])
             
             fig, ax = plt.subplots(figsize=(max(6, len(labels) * 0.8), 4.5))
-            ax.bar(x, cldice_values, yerr=cldice_errors, capsize=5, color='seagreen')
+            ax.bar([len(per_model_metrics)], [cldice_mean], yerr=[cldice_std if len(ensemble_metrics["cldice"]) > 1 else 0.0],
+                   capsize=5, color='seagreen')
             ax.set_ylabel('clDice Score')
-            ax.set_title('Model vs Ensemble clDice Scores')
-            ax.set_xticks(x)
-            ax.set_xticklabels(labels, rotation=45, ha='right')
+            ax.set_title('Ensemble clDice Score')
+            ax.set_xticks([len(per_model_metrics)])
+            ax.set_xticklabels(['Ensemble'])
             ax.set_ylim(0.0, 1.0)
             ax.grid(axis='y', linestyle='--', alpha=0.4)
             fig.tight_layout()
@@ -607,8 +642,8 @@ def main():
                         help='Path to data directory')
     parser.add_argument('--output_dir', type=str, default='./results/predictions_ensemble',
                         help='Path to save predictions')
-    parser.add_argument('--image_list', type=str, default=None,
-                        help='Optional text file with image ids to process (e.g., from generated test list)')
+    parser.add_argument('--image_list', type=str, action='append', default=None,
+                        help='Optional text file(s) with image ids to process; pass multiple times for train/test/all')
     
     # Inference parameters
     parser.add_argument('--patch_size', type=int, nargs=3, default=[64, 64, 64],
@@ -624,7 +659,15 @@ def main():
     parser.add_argument('--amp', action='store_true',
                         help='Enable mixed-precision (autocast) inference on CUDA')
     parser.add_argument('--save_per_model_preds', action='store_true',
-                        help='Save each model\'s prediction as NIfTI under output_dir/per_model/model_i')
+                        help='Save each model\'s prediction as NIfTI (defaults to output_dir/per_model/model_i)')
+    parser.add_argument('--per_model_output_root', type=str, default='./data/unet_prediction',
+                        help='Base directory for per-model predictions (default: ./data/unet_prediction)')
+    parser.add_argument('--ensemble_output_root', type=str, default='./data/unet_prediction/ensemble',
+                        help='Additional directory to save ensemble predictions (default: ./data/unet_prediction/ensemble)')
+    parser.add_argument('--binarize_saved_outputs', action='store_true',
+                        help='Binarize saved predictions using --threshold (useful to store label masks)')
+    parser.add_argument('--skip_metrics', action='store_true',
+                        help='Skip Dice/clDice computation and CSV logging')
     parser.add_argument('--resume', action='store_true',
                         help='Resume prediction from where it was interrupted (skip already processed images)')
     
