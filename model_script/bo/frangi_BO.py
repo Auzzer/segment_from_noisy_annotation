@@ -23,12 +23,9 @@ python -m model_script.bo.frangi_BO \
   --bounds_beta  0.45,0.55 \
   --bounds_gamma 3.0,8.0 \
   --bounds_thr   0.05,0.20 \
-  --n_init 12 \
-  --n_iter 40 \
-  --batch_size 3 \
-  --device 0 \
-  --seed 0 \
-  --theta_workers 3
+  --n_init 12 --n_iter 40 --batch_size 3 \
+  --device 0  --seed 0 --theta_workers 3\
+  --no_preload
 
 
   python -m model_script.bo.frangi_BO \
@@ -52,6 +49,7 @@ import concurrent.futures
 import json
 import random
 import sys
+import multiprocessing as mp
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Dict, List, Sequence, Tuple
@@ -549,7 +547,10 @@ def main() -> None:
                 args.device,
                 args.save_outputs,
             )
-            with concurrent.futures.ProcessPoolExecutor(max_workers=args.theta_workers) as ex:
+            spawn_ctx = mp.get_context("spawn")
+            with concurrent.futures.ProcessPoolExecutor(
+                max_workers=args.theta_workers, mp_context=spawn_ctx
+            ) as ex:
                 future_to_theta = {
                     ex.submit(_evaluate_theta_task, theta_next, shared_args): theta_next
                     for theta_next in theta_batch

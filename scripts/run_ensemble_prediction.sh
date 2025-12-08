@@ -24,9 +24,9 @@ PATCH_BATCH_SIZE=64
 USE_AMP=false
 TEST_LIST="${PROJECT_ROOT}/data/splits/test_list.txt"
 
-# Check for resume flag
+# Check for resume flag (handle no-arg safely)
 RESUME_FLAG=""
-if [ "$1" == "--resume" ] || [ "$1" == "-r" ]; then
+if [ "${1-}" == "--resume" ] || [ "${1-}" == "-r" ]; then
     RESUME_FLAG="--resume"
     echo "========================================"
     echo "RESUMING ensemble prediction"
