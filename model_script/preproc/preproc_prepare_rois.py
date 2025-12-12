@@ -25,13 +25,15 @@ def parse_id(path: Path) -> str:
 
 
 def robust_normalize(volume: np.ndarray, mask: np.ndarray | None) -> np.ndarray:
-    """Clip to 1/99 percentiles (on mask if provided) and rescale to [0,1]."""
+    """Clip to blood HU range and rescale to [0,1]."""
     work = volume[mask] if mask is not None and mask.any() else volume
-    p1, p99 = np.percentile(work, [1, 99])
-    if p99 <= p1:
-        return np.zeros_like(volume, dtype=np.float32)
-    clipped = np.clip(volume, p1, p99)
-    norm = (clipped - p1) / (p99 - p1)
+    blood_low = 30
+    blood_high = 70 # or 300 if contrast
+    #p1, p99 = np.percentile(work, [1, 99])
+    #if p99 <= p1:
+    #    return np.zeros_like(volume, dtype=np.float32)
+    clipped = np.clip(volume, blood_low, blood_high)
+    norm = (clipped - blood_low) / (blood_high - blood_low)
     return norm.astype(np.float32, copy=False)
 
 
