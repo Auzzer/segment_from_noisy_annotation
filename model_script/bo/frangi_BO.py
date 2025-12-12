@@ -69,6 +69,8 @@ import numpy as np
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import Matern, WhiteKernel
 from tqdm import tqdm
+from totalsegmentator.python_api import totalsegmentator  # NEW
+import tempfile # NEW
 
 @dataclass
 class Theta:
@@ -163,6 +165,29 @@ def run_frangi_case(
 ) -> float | None:
     """Run Frangi for one case and return Dice."""
     output_basename = f"frangi_{image_path.name}"
+    # NEW code add here
+    # --- NEW: TotalSegmentator lung+heart masking ---
+    img = nib.load(str(image_path))
+    orig_img = img.get_fdata(dtype=np.float32)
+
+    # Run TotalSegmentator to get heart + lung
+    with tempfile.TemporaryDirectory() as tmpdir:
+        seg = totalsegmentator(
+            input_path=str(image_path),
+            output_path=tmpdir,
+            task="total",
+            quiet=True
+        )
+        # seg is dict of numpy arrays; combine heart + lungs
+        mask = (seg["heart"] > 0) | (seg["lung_upper_lobe_left"] > 0) | (seg["lung_upper_lobe_right"] > 0) | \
+               (seg["lung_lower_lobe_left"] > 0) | (seg["lung_lower_lobe_right"] > 0)
+
+    masked_img = orig_img * mask.astype(np.float32)
+    # overwrite roi_data image
+    if roi_data is not None:
+        roi_data.image = masked_img
+    # -------------------------------------------------
+
     if roi_data is not None:
         return frangi_gpu.run_frangi_array(
             image=roi_data.image,
