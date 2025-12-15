@@ -19,17 +19,25 @@ Example (iso inputs):
     --checkpoint_template "/projectnb/ec500kb/projects/Fall_2025_Projects/vessel_seg/Dataset001_nnunet/seed_{seed}/Dataset001_nnunet/nnUNetTrainer__nnUNetPlans__3d_fullres/fold_{fold}/checkpoint_best.pth" \
     --fold 0 --num_models 10 \
     --image_source iso \
-    --images_dir ./data_preproc/images_iso \
-    --labels_dir ./data_preproc/labels_iso \
+    --images_dir ./data_preco/images_iso \
+    --labels_dir ./data_preco/labels_iso \
     --mean_output_dir /projectnb/ec500kb/projects/Fall_2025_Projects/vessel_seg/data/unet_prediction/mean \
     --staple_output_dir /projectnb/ec500kb/projects/Fall_2025_Projects/vessel_seg/data/unet_prediction/staple
 
 Example (orig inputs):
   python -m model_script.predict.predict_ensemble \
-    --checkpoint_template "...fold_{fold}/checkpoint_best.pth" \
-    --image_source orig --orig_images_dir ./data/images --orig_labels_dir ./data/label
+    --checkpoint_template "/projectnb/ec500kb/projects/Fall_2025_Projects/vessel_seg/Dataset001_nnunet/seed_{seed}/Dataset001_nnunet/nnUNetTrainer__nnUNetPlans__3d_fullres/fold_{fold}/checkpoint_best.pth" \
+    --fold 0 --num_models 10 \
+    --image_source orig --orig_images_dir ./data/images --orig_labels_dir ./data/label\
+    --mean_output_dir /projectnb/ec500kb/projects/Fall_2025_Projects/vessel_seg/data/unet_prediction/mean \
+    --staple_output_dir /projectnb/ec500kb/projects/Fall_2025_Projects/vessel_seg/data/unet_prediction/staple
 """
 
+try:
+    from monai.metrics import compute_meandice as monai_compute_dice
+except ImportError:
+    from monai.metrics import compute_dice as monai_compute_dice
+    
 EPS = 1e-8
 
 from utils.unet_model import UNet3D
@@ -125,21 +133,6 @@ def compute_cldice_score(pred_binary, target_binary, target_skeleton=None):
     return float(cldice), target_skeleton
 
 
-def compute_dice_score(pred_binary: np.ndarray, target_binary: np.ndarray) -> float:
-    """Compute standard Dice for two binary volumes."""
-    pred_binary = np.asarray(pred_binary).astype(bool)
-    target_binary = np.asarray(target_binary).astype(bool)
-
-    pred_sum = int(pred_binary.sum())
-    target_sum = int(target_binary.sum())
-
-    if pred_sum == 0 and target_sum == 0:
-        return 1.0
-
-    intersection = int(np.logical_and(pred_binary, target_binary).sum())
-    return float((2.0 * intersection) / (pred_sum + target_sum + EPS))
-
-
 def log_stats(name: str, arr: np.ndarray):
     arr = np.asarray(arr)
     print(
@@ -210,9 +203,6 @@ def load_ensemble_models(checkpoint_template: str, num_models: int, fold: int, d
         model.load_state_dict(filtered_state, strict=False)
         model = model.to(device)
         model.eval()
-        # Preserve the seed id for downstream bookkeeping (e.g., per-model exports).
-        model._ensemble_seed = seed
-        model._ensemble_checkpoint_path = str(model_path)
         
         models.append(model)
         val_dice = checkpoint.get('val_dice') if isinstance(checkpoint, dict) else None
@@ -564,17 +554,25 @@ def predict_single_model(
 
 
 def calculate_metrics(pred, target, threshold=0.5, target_skeleton=None, compute_cldice=True):
-    """Calculate Dice and optional clDice scores (clDice via skeleton overlap)."""
+    """Calculate Dice and optional clDice scores using MONAI Dice and custom clDice."""
     log_stats("Metric input pred", pred)
     log_stats("Metric input target", target)
-
-    pred_binary_np = (np.asarray(pred) > threshold)
-    target_binary_np = (np.asarray(target) > 0.5)
-
-    dice = compute_dice_score(pred_binary_np, target_binary_np)
-
+    pred_tensor = torch.from_numpy(pred).unsqueeze(0).unsqueeze(0)
+    target_tensor = torch.from_numpy(target).unsqueeze(0).unsqueeze(0)
+    
+    pred_binary = (pred_tensor > threshold).float()
+    target_binary = (target_tensor > 0.5).float()
+    
+    dice_tensor = monai_compute_dice(
+        pred_binary, target_binary, include_background=True
+    )
+    dice = torch.nan_to_num(dice_tensor, nan=1.0).mean().item()
+    
     cldice = None
     if compute_cldice:
+        pred_binary_np = pred_binary.cpu().numpy().astype(bool)[0, 0]
+        target_binary_np = target_binary.cpu().numpy().astype(bool)[0, 0]
+        
         cldice, target_skeleton = compute_cldice_score(
             pred_binary_np, target_binary_np, target_skeleton=target_skeleton
         )
@@ -617,7 +615,7 @@ def predict_on_dataset(args):
         """Optionally binarize prediction before writing to disk."""
         if args.binarize_saved_outputs:
             return (volume > args.threshold).astype(np.uint8)
-        return np.asarray(volume, dtype=np.float32)
+        return volume
     
     # Create output directories
     mean_output_dir = Path(args.mean_output_dir)
@@ -626,15 +624,13 @@ def predict_on_dataset(args):
     staple_output_dir.mkdir(parents=True, exist_ok=True)
     output_dir = mean_output_dir  # used for metrics/csv/plots
     lung_mask_dir = Path(args.lung_mask_dir)
-    per_model_output_root: Path | None = None
-    if args.save_per_model_preds:
-        per_model_output_root = (
-            Path(args.per_model_output_root)
-            if args.per_model_output_root
-            else mean_output_dir / 'per_model'
-        )
-        per_model_output_root.mkdir(parents=True, exist_ok=True)
-        print(f"Per-model predictions will be saved under: {per_model_output_root}")
+    per_model_output_root = (
+        Path(args.per_model_output_root)
+        if args.per_model_output_root is not None
+        else mean_output_dir / 'per_model'
+    )
+    per_model_output_root.mkdir(parents=True, exist_ok=True)
+    print(f"Per-model predictions will be saved under: {per_model_output_root}")
     
     # Get list of images to process
     images_dir = Path(args.images_dir if args.image_source == 'iso' else args.orig_images_dir)
@@ -733,16 +729,13 @@ def predict_on_dataset(args):
                 log_stats(f"Model {idx} pred stats", model_pred)
                 model_predictions.append(model_pred)
 
-                # Save per-model prediction (optional)
-                if per_model_output_root is not None:
-                    seed = getattr(model, "_ensemble_seed", None)
-                    model_dir = f"seed_{seed}" if isinstance(seed, int) else f"model_{idx}"
-                    m_dir = per_model_output_root / model_dir
-                    m_dir.mkdir(parents=True, exist_ok=True)
-                    m_path = m_dir / f'pred_{img_num}.nii.gz'
-                    m_pred_to_save = prepare_for_saving(model_pred)
-                    m_nifti = nib.Nifti1Image(m_pred_to_save, img_nifti.affine, img_nifti.header.copy())
-                    nib.save(m_nifti, str(m_path))
+                # Save per-model prediction
+                m_dir = per_model_output_root / f'model_{idx}'
+                m_dir.mkdir(parents=True, exist_ok=True)
+                m_path = m_dir / f'pred_{img_num}.nii.gz'
+                m_pred_to_save = prepare_for_saving(model_pred)
+                m_nifti = nib.Nifti1Image(m_pred_to_save, img_nifti.affine, img_nifti.header)
+                nib.save(m_nifti, str(m_path))
 
             # Fuse mean and STAPLE, already lung-masked
             prediction_mean = np.mean(model_predictions, axis=0)
@@ -754,12 +747,12 @@ def predict_on_dataset(args):
 
             # Save prediction (ensemble)
             mean_to_save = prepare_for_saving(prediction_mean)
-            pred_nifti = nib.Nifti1Image(mean_to_save, img_nifti.affine, img_nifti.header.copy())
+            pred_nifti = nib.Nifti1Image(mean_to_save, img_nifti.affine, img_nifti.header)
             pred_path = mean_output_dir / f'pred_{img_num}.nii.gz'
             nib.save(pred_nifti, str(pred_path))
 
             staple_to_save = prepare_for_saving(prediction_staple)
-            staple_nifti = nib.Nifti1Image(staple_to_save, img_nifti.affine, img_nifti.header.copy())
+            staple_nifti = nib.Nifti1Image(staple_to_save, img_nifti.affine, img_nifti.header)
             staple_path = staple_output_dir / f'pred_{img_num}.nii.gz'
             nib.save(staple_nifti, str(staple_path))
             
@@ -917,7 +910,7 @@ def main():
     parser.add_argument(
         '--images_dir',
         type=str,
-        default='./data_preproc/images_iso',
+        default='./data_preco/images_iso',
         help='Path to isotropic input images (NIfTI).',
     )
     parser.add_argument(
@@ -936,13 +929,13 @@ def main():
     parser.add_argument(
         '--labels_dir',
         type=str,
-        default='./data_preproc/labels_iso',
+        default='./data_preco/labels_iso',
         help='Path to ground-truth labels (NIfTI) used when --image_source=iso.',
     )
     parser.add_argument(
         '--orig_labels_dir',
         type=str,
-        default='./data/labels',
+        default='./data/label',
         help='Path to ground-truth labels for original-resolution images.',
     )
     parser.add_argument(
@@ -977,24 +970,10 @@ def main():
                         help='Number of patches to forward simultaneously during inference (raise to use more GPU memory)')
     parser.add_argument('--amp', action='store_true',
                         help='Enable mixed-precision (autocast) inference on CUDA')
-    parser.add_argument(
-        '--save_per_model_preds',
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help='Save each individual model prediction volume under --per_model_output_root.',
-    )
-    parser.add_argument(
-        '--per_model_output_root',
-        type=str,
-        default=None,
-        help="Base directory for per-model predictions (default: <mean_output_dir>/per_model).",
-    )
-    parser.add_argument(
-        '--binarize_saved_outputs',
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help='Binarize saved predictions using --threshold (use --no-binarize_saved_outputs to save probabilities).',
-    )
+    parser.add_argument('--per_model_output_root', type=str, default='./data/unet_prediction',
+                        help='Base directory for per-model predictions (default: ./data/unet_prediction)')
+    parser.add_argument('--binarize_saved_outputs', action='store_true', default=True,
+                        help='Binarize saved predictions using --threshold (default: on)')
     parser.add_argument('--skip_metrics', action='store_true',
                         help='Skip Dice/clDice computation and CSV logging')
     parser.add_argument('--resume', action='store_true',

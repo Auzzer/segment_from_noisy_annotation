@@ -1,6 +1,5 @@
 """Predict with a saved MTCL leader model and report Dice/clDice.
-python model_script/predict/predict_mtcl_model.py --data_dir ./data --ids_file data/splits/test_list.txt
-
+python model_script/predict/predict_mtcl_model.py --data_dir ./data --ids_file data/splits/test_list.txt --output_dir ./data/mtcl/
 """
 
 from __future__ import annotations
@@ -23,7 +22,7 @@ from utils.unet_model import UNet3D
 from model_script.train import mtcl as mtcl_train
 from model_script.predict.predict_ensemble import calculate_metrics
 
-DEFAULT_MTCL_CKPT_DIR = Path("./results/output_mtcl_finetune/checkpoints")
+DEFAULT_MTCL_CKPT_DIR = Path("/projectnb/ec500kb/projects/Fall_2025_Projects/vessel_seg/results/output_mtcl/mtcl_best.pth")
 
 
 def _resolve_state_dict(raw_obj: dict) -> dict:
@@ -222,12 +221,12 @@ def parse_args():
     parser.add_argument(
         "--checkpoint",
         type=Path,
-        default=None,
+        default="/projectnb/ec500kb/projects/Fall_2025_Projects/vessel_seg/results/output_mtcl/mtcl_best.pth",
         help=f"Path to MTCL checkpoint (.pth). If omitted, the latest file in {DEFAULT_MTCL_CKPT_DIR} is used.",
     )
     parser.add_argument("--patch_size", type=int, nargs=3, default=[64, 64, 64], help="Sliding window patch size")
     parser.add_argument("--overlap", type=float, default=0.5, help="Overlap ratio between sliding windows")
-    parser.add_argument("--patch_batch_size", type=int, default=8, help="Number of patches per forward pass")
+    parser.add_argument("--patch_batch_size", type=int, default=48, help="Number of patches per forward pass")
     parser.add_argument("--threshold", type=float, default=0.5, help="Threshold for binarizing predictions")
     parser.add_argument(
         "--output_dir",
