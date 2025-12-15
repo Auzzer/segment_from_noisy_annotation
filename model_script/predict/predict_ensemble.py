@@ -13,14 +13,30 @@ from contextlib import nullcontext
 from torch.cuda.amp import autocast
 import csv
 
-try:
-    from monai.metrics import compute_meandice as monai_compute_dice
-except ImportError:
-    from monai.metrics import compute_dice as monai_compute_dice
-    
+"""
+Example (iso inputs):
+  python -m model_script.predict.predict_ensemble \
+    --checkpoint_template "/projectnb/ec500kb/projects/Fall_2025_Projects/vessel_seg/Dataset001_nnunet/seed_{seed}/Dataset001_nnunet/nnUNetTrainer__nnUNetPlans__3d_fullres/fold_{fold}/checkpoint_best.pth" \
+    --fold 0 --num_models 10 \
+    --image_source iso \
+    --images_dir ./data_preproc/images_iso \
+    --labels_dir ./data_preproc/labels_iso \
+    --mean_output_dir /projectnb/ec500kb/projects/Fall_2025_Projects/vessel_seg/data/unet_prediction/mean \
+    --staple_output_dir /projectnb/ec500kb/projects/Fall_2025_Projects/vessel_seg/data/unet_prediction/staple
+
+Example (orig inputs):
+  python -m model_script.predict.predict_ensemble \
+    --checkpoint_template "...fold_{fold}/checkpoint_best.pth" \
+    --image_source orig --orig_images_dir ./data/images --orig_labels_dir ./data/label
+"""
+
 EPS = 1e-8
 
 from utils.unet_model import UNet3D
+
+# Helpers for orientation (SimpleITK returns arrays as (z, y, x); convert to (x, y, z))
+def sitk_to_nib_order(arr: np.ndarray) -> np.ndarray:
+    return np.transpose(arr, (2, 1, 0))
 
 
 def normalize_image_id(name: str) -> str:
@@ -109,33 +125,101 @@ def compute_cldice_score(pred_binary, target_binary, target_skeleton=None):
     return float(cldice), target_skeleton
 
 
-def load_ensemble_models(checkpoint_dir, num_models, device):
-    """Load all models in the ensemble"""
+def compute_dice_score(pred_binary: np.ndarray, target_binary: np.ndarray) -> float:
+    """Compute standard Dice for two binary volumes."""
+    pred_binary = np.asarray(pred_binary).astype(bool)
+    target_binary = np.asarray(target_binary).astype(bool)
+
+    pred_sum = int(pred_binary.sum())
+    target_sum = int(target_binary.sum())
+
+    if pred_sum == 0 and target_sum == 0:
+        return 1.0
+
+    intersection = int(np.logical_and(pred_binary, target_binary).sum())
+    return float((2.0 * intersection) / (pred_sum + target_sum + EPS))
+
+
+def log_stats(name: str, arr: np.ndarray):
+    arr = np.asarray(arr)
+    print(
+        f"{name}: shape {arr.shape}, min {arr.min():.4f}, max {arr.max():.4f}, mean {arr.mean():.4f}"
+    )
+
+
+def load_ensemble_models(checkpoint_template: str, num_models: int, fold: int, device):
+    """Load all models in the ensemble using a seed-indexed checkpoint template."""
     models = []
     
-    print(f"Loading {num_models} models from {checkpoint_dir}")
-    for model_id in range(num_models):
-        model_path = Path(checkpoint_dir) / f'model_{model_id}' / 'best.pth'
+    print(f"Loading {num_models} models from template: {checkpoint_template} (fold={fold})")
+    for seed in range(1, num_models + 1):
+        try:
+            model_path = Path(checkpoint_template.format(seed=seed, fold=fold))
+        except KeyError as exc:
+            raise ValueError(
+                "checkpoint_template must contain '{seed}' and '{fold}' placeholders for numbering."
+            ) from exc
         
         if not model_path.exists():
-            print(f"Warning: Model {model_id} checkpoint not found at {model_path}")
+            print(f"Warning: Model seed {seed} checkpoint not found at {model_path}")
             continue
         
-        # Create model
-        model = UNet3D(n_channels=1, n_classes=1, trilinear=True)
-        
-        # Load checkpoint
-        checkpoint = torch.load(model_path, map_location=device)
-        model.load_state_dict(checkpoint['model_state_dict'])
+        # Torch 2.6 defaults to weights_only=True, which breaks older checkpoints; force False with fallback
+        try:
+            checkpoint = torch.load(model_path, map_location=device, weights_only=False)
+        except TypeError:
+            checkpoint = torch.load(model_path, map_location=device)
+        if isinstance(checkpoint, dict):
+            state = checkpoint.get('model_state_dict') or checkpoint.get('state_dict') or checkpoint
+        else:
+            state = checkpoint
+        # Strip DistributedDataParallel prefixes if present
+        if isinstance(state, dict):
+            state = {k.replace("module.", "", 1): v for k, v in state.items()}
+        else:
+            raise ValueError(f"Unexpected checkpoint structure for {model_path}")
+
+        # Infer number of classes from the head shape (supports legacy 1-ch and new 2-ch heads)
+        head_w = state.get('outc.conv.weight')
+        n_classes = head_w.shape[0] if head_w is not None else 1
+        if n_classes not in (1, 2):
+            print(f"  Warning: unexpected head channels={n_classes}; defaulting to 1")
+            n_classes = 1
+
+        model = UNet3D(n_channels=1, n_classes=n_classes, trilinear=True)
+        # If checkpoint is legacy 1-channel and model is 2-channel, map weights
+        model_state = model.state_dict()
+        filtered_state = {}
+        if n_classes == 2 and head_w is not None and head_w.shape[0] == 1:
+            new_w = model_state['outc.conv.weight'].clone()
+            new_b = model_state['outc.conv.bias'].clone()
+            new_w.zero_()
+            new_b.zero_()
+            new_w[1] = head_w[0]
+            new_b[1] = state['outc.conv.bias'][0]
+            filtered_state['outc.conv.weight'] = new_w
+            filtered_state['outc.conv.bias'] = new_b
+            print(f"  Seed {seed}: expanded 1->2 channel head during load.")
+
+        for k, v in state.items():
+            if n_classes == 2 and k in ('outc.conv.weight', 'outc.conv.bias') and head_w.shape[0] == 1:
+                continue
+            if k in model_state and model_state[k].shape == v.shape:
+                filtered_state[k] = v
+
+        model.load_state_dict(filtered_state, strict=False)
         model = model.to(device)
         model.eval()
+        # Preserve the seed id for downstream bookkeeping (e.g., per-model exports).
+        model._ensemble_seed = seed
+        model._ensemble_checkpoint_path = str(model_path)
         
         models.append(model)
-        val_dice = checkpoint.get('val_dice')
+        val_dice = checkpoint.get('val_dice') if isinstance(checkpoint, dict) else None
         if isinstance(val_dice, (float, int)):
-            print(f"  Loaded model {model_id} (Dice: {val_dice:.4f})")
+            print(f"  Loaded seed {seed} (Dice: {val_dice:.4f})")
         else:
-            print(f"  Loaded model {model_id} (Dice: N/A)")
+            print(f"  Loaded seed {seed} (Dice: N/A)")
     
     print(f"Successfully loaded {len(models)} models")
     return models
@@ -167,6 +251,76 @@ def fuse_predictions(model_predictions, method="mean", threshold=0.5):
         return fused
 
     raise ValueError(f"Unknown fusion method '{method}' (expected 'mean' or 'staple').")
+
+
+def load_lung_mask(mask_dir: Path, img_num: str, expected_shape, image_path: Path) -> np.ndarray:
+    """Load and binarize a lung mask for the given image number, resampling if needed."""
+    candidates = [
+        mask_dir / f"lung_mask_{img_num}.nii.gz",
+        mask_dir / f"lung_mask_image_{img_num}.nii.gz",
+    ]
+    mask_path = next((p for p in candidates if p.exists()), None)
+    if mask_path is None:
+        raise FileNotFoundError(f"Lung mask not found for image {img_num} in {mask_dir}")
+
+    try:
+        import SimpleITK as sitk
+    except ImportError as exc:  # pragma: no cover - dependency error path
+        raise ImportError("SimpleITK is required to load/resample lung masks.") from exc
+
+    mask_img_sitk = sitk.ReadImage(str(mask_path))
+    mask_np = sitk_to_nib_order(sitk.GetArrayFromImage(mask_img_sitk))
+    mask_np = (mask_np > 0).astype(np.float32)
+    if mask_np.shape == expected_shape:
+        return mask_np
+
+    # Resample mask to match image geometry
+    target_img_sitk = sitk.ReadImage(str(image_path))
+    resampled = sitk.Resample(
+        mask_img_sitk,
+        target_img_sitk,
+        sitk.Transform(),
+        sitk.sitkNearestNeighbor,
+        0.0,
+        mask_img_sitk.GetPixelID(),
+    )
+    mask_resampled = sitk_to_nib_order(sitk.GetArrayFromImage(resampled))
+    mask_resampled = (mask_resampled > 0).astype(np.float32)
+    if mask_resampled.shape != expected_shape:
+        raise ValueError(
+            f"Lung mask shape {mask_resampled.shape} still mismatches image shape {expected_shape} for {img_num} after resampling."
+        )
+    return mask_resampled
+
+
+def load_label_resampled(label_path: Path, image_path: Path, expected_shape) -> np.ndarray:
+    """Load label and resample to match the given image geometry if needed."""
+    try:
+        import SimpleITK as sitk
+    except ImportError as exc:  # pragma: no cover - dependency error path
+        raise ImportError("SimpleITK is required to resample labels.") from exc
+
+    label_img = sitk.ReadImage(str(label_path))
+    target_img = sitk.ReadImage(str(image_path))
+
+    if label_img.GetSize() != target_img.GetSize():
+        resampled = sitk.Resample(
+            label_img,
+            target_img,
+            sitk.Transform(),
+            sitk.sitkNearestNeighbor,
+            0.0,
+            label_img.GetPixelID(),
+        )
+    else:
+        resampled = label_img
+
+    label_np = sitk_to_nib_order(sitk.GetArrayFromImage(resampled)).astype(np.float32)
+    if label_np.shape != expected_shape:
+        raise ValueError(
+            f"Label shape {label_np.shape} still mismatches image shape {expected_shape} after resampling."
+        )
+    return label_np
 
 
 def predict_with_ensemble(
@@ -256,15 +410,19 @@ def predict_with_ensemble(
             with autocast_ctx():
                 for model_idx, model in enumerate(models):
                     preds = model(batch_tensor)
-                    preds = torch.sigmoid(preds)
-                    preds_np = preds.detach().cpu().numpy()
+                    if preds.shape[1] == 1:
+                        preds = torch.sigmoid(preds)
+                        preds_np = preds.detach().cpu().numpy()[:, 0]
+                    else:
+                        preds = torch.softmax(preds, dim=1)
+                        preds_np = preds.detach().cpu().numpy()[:, 1]
                     
                     for i, (d_start_i, h_start_i, w_start_i) in enumerate(patch_coords):
                         model_prediction_sums[model_idx][
                             d_start_i:d_start_i+pd,
                             h_start_i:h_start_i+ph,
                             w_start_i:w_start_i+pw
-                        ] += preds_np[i, 0]
+                        ] += preds_np[i]
             
             processed = len(patch_coords)
             patch_tensors.clear()
@@ -313,24 +471,110 @@ def predict_with_ensemble(
     return prediction, model_predictions
 
 
+def predict_single_model(
+    model,
+    image: np.ndarray,
+    device,
+    patch_size=(64, 64, 64),
+    overlap=0.5,
+    patch_batch_size=1,
+    use_amp=False,
+):
+    """
+    Sliding-window prediction for a single model, returning a full-volume probability map.
+    """
+    d, h, w = image.shape
+    pd, ph, pw = patch_size
+
+    stride_d = max(1, int(pd * (1 - overlap)))
+    stride_h = max(1, int(ph * (1 - overlap)))
+    stride_w = max(1, int(pw * (1 - overlap)))
+
+    count_map = np.zeros((d, h, w), dtype=np.float32)
+    pred_sum = np.zeros((d, h, w), dtype=np.float32)
+
+    image_normalized = (image - image.mean()) / (image.std() + 1e-8)
+
+    d_starts = list(range(0, max(1, d - pd + 1), stride_d))
+    h_starts = list(range(0, max(1, h - ph + 1), stride_h))
+    w_starts = list(range(0, max(1, w - pw + 1), stride_w))
+    if d_starts[-1] + pd < d:
+        d_starts.append(d - pd)
+    if h_starts[-1] + ph < h:
+        h_starts.append(h - ph)
+    if w_starts[-1] + pw < w:
+        w_starts.append(w - pw)
+
+    total_patches = len(d_starts) * len(h_starts) * len(w_starts)
+    patch_batch_size = max(1, int(patch_batch_size))
+    autocast_ctx = autocast if (use_amp and device.type == 'cuda') else nullcontext
+
+    patch_tensors = []
+    patch_coords = []
+
+    with torch.no_grad():
+        pbar = tqdm(total=total_patches, desc="Inference (per model)")
+
+        def flush_batch():
+            if not patch_tensors:
+                return
+            batch_tensor = torch.cat(patch_tensors, dim=0).to(device, non_blocking=True)
+            with autocast_ctx():
+                preds = model(batch_tensor)
+                if preds.shape[1] == 1:
+                    preds = torch.sigmoid(preds)
+                    preds_np = preds.detach().cpu().numpy()[:, 0]
+                else:
+                    preds = torch.softmax(preds, dim=1)
+                    preds_np = preds.detach().cpu().numpy()[:, 1]
+            for i, (d_start_i, h_start_i, w_start_i) in enumerate(patch_coords):
+                pred_sum[
+                    d_start_i:d_start_i+pd,
+                    h_start_i:h_start_i+ph,
+                    w_start_i:w_start_i+pw
+                ] += preds_np[i]
+                count_map[
+                    d_start_i:d_start_i+pd,
+                    h_start_i:h_start_i+ph,
+                    w_start_i:w_start_i+pw
+                ] += 1
+            processed = len(patch_coords)
+            patch_tensors.clear()
+            patch_coords.clear()
+            pbar.update(processed)
+
+        for d_start in d_starts:
+            for h_start in h_starts:
+                for w_start in w_starts:
+                    patch = image_normalized[
+                        d_start:d_start+pd,
+                        h_start:h_start+ph,
+                        w_start:w_start+pw
+                    ]
+                    patch_tensor = torch.from_numpy(patch).unsqueeze(0).unsqueeze(0).float()
+                    patch_tensors.append(patch_tensor)
+                    patch_coords.append((d_start, h_start, w_start))
+                    if len(patch_tensors) >= patch_batch_size:
+                        flush_batch()
+        flush_batch()
+        pbar.close()
+
+    prediction = pred_sum / (count_map + 1e-8)
+    return prediction
+
+
 def calculate_metrics(pred, target, threshold=0.5, target_skeleton=None, compute_cldice=True):
-    """Calculate Dice and optional clDice scores using MONAI Dice and custom clDice."""
-    pred_tensor = torch.from_numpy(pred).unsqueeze(0).unsqueeze(0)
-    target_tensor = torch.from_numpy(target).unsqueeze(0).unsqueeze(0)
-    
-    pred_binary = (pred_tensor > threshold).float()
-    target_binary = (target_tensor > 0.5).float()
-    
-    dice_tensor = monai_compute_dice(
-        pred_binary, target_binary, include_background=True
-    )
-    dice = torch.nan_to_num(dice_tensor, nan=1.0).mean().item()
-    
+    """Calculate Dice and optional clDice scores (clDice via skeleton overlap)."""
+    log_stats("Metric input pred", pred)
+    log_stats("Metric input target", target)
+
+    pred_binary_np = (np.asarray(pred) > threshold)
+    target_binary_np = (np.asarray(target) > 0.5)
+
+    dice = compute_dice_score(pred_binary_np, target_binary_np)
+
     cldice = None
     if compute_cldice:
-        pred_binary_np = pred_binary.cpu().numpy().astype(bool)[0, 0]
-        target_binary_np = target_binary.cpu().numpy().astype(bool)[0, 0]
-        
         cldice, target_skeleton = compute_cldice_score(
             pred_binary_np, target_binary_np, target_skeleton=target_skeleton
         )
@@ -355,7 +599,8 @@ def predict_on_dataset(args):
     
     # Load ensemble models
     models = load_ensemble_models(
-        checkpoint_dir=Path(args.checkpoint_dir) / 'checkpoints',
+        checkpoint_template=args.checkpoint_template,
+        fold=args.fold,
         num_models=args.num_models,
         device=device
     )
@@ -372,29 +617,28 @@ def predict_on_dataset(args):
         """Optionally binarize prediction before writing to disk."""
         if args.binarize_saved_outputs:
             return (volume > args.threshold).astype(np.uint8)
-        return volume
+        return np.asarray(volume, dtype=np.float32)
     
-    # Create output directory
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    ensemble_output_root = None
-    if args.ensemble_output_root:
-        ensemble_output_root = Path(args.ensemble_output_root)
-        ensemble_output_root.mkdir(parents=True, exist_ok=True)
-        print(f"Ensemble predictions will also be saved under: {ensemble_output_root}")
-    per_model_output_root = None
+    # Create output directories
+    mean_output_dir = Path(args.mean_output_dir)
+    staple_output_dir = Path(args.staple_output_dir)
+    mean_output_dir.mkdir(parents=True, exist_ok=True)
+    staple_output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = mean_output_dir  # used for metrics/csv/plots
+    lung_mask_dir = Path(args.lung_mask_dir)
+    per_model_output_root: Path | None = None
     if args.save_per_model_preds:
         per_model_output_root = (
             Path(args.per_model_output_root)
-            if args.per_model_output_root is not None
-            else output_dir / 'per_model'
+            if args.per_model_output_root
+            else mean_output_dir / 'per_model'
         )
         per_model_output_root.mkdir(parents=True, exist_ok=True)
         print(f"Per-model predictions will be saved under: {per_model_output_root}")
     
     # Get list of images to process
-    images_dir = Path(args.data_dir) / 'images'
-    labels_dir = Path(args.data_dir) / 'labels'
+    images_dir = Path(args.images_dir if args.image_source == 'iso' else args.orig_images_dir)
+    labels_dir = Path(args.labels_dir if args.image_source == 'iso' else args.orig_labels_dir)
     
     image_files = sorted(list(images_dir.glob('*.nii.gz')))
     
@@ -459,7 +703,7 @@ def predict_on_dataset(args):
     
     try:
         for img_file in tqdm(image_files, desc="Processing images"):
-            # Extract image number
+        # Extract image number
             img_num = img_file.stem.split('.')[0].split('_')[1]
             img_id = f"image_{img_num}"
             
@@ -470,39 +714,54 @@ def predict_on_dataset(args):
             # Load image
             img_nifti = nib.load(str(img_file))
             image = img_nifti.get_fdata().astype(np.float32)
+            # Temporarily disable lung masking
+            lung_mask = np.ones_like(image, dtype=np.float32)
             
-            # Make prediction
-            prediction, model_predictions = predict_with_ensemble(
-                models,
-                image,
-                device,
-                patch_size=tuple(args.patch_size),
-                overlap=args.overlap,
-                patch_batch_size=args.patch_batch_size,
-                use_amp=args.amp,
-                fusion_method=args.fusion_method,
-                fusion_threshold=args.threshold,
-            )
-            
-            # Save prediction (ensemble)
-            pred_to_save = prepare_for_saving(prediction)
-            pred_nifti = nib.Nifti1Image(pred_to_save, img_nifti.affine, img_nifti.header)
-            pred_path = output_dir / f'pred_{img_num}.nii.gz'
-            nib.save(pred_nifti, str(pred_path))
-            if ensemble_output_root is not None:
-                ensemble_path = ensemble_output_root / f'pred_{img_num}.nii.gz'
-                nib.save(pred_nifti, str(ensemble_path))
-            
-            # Optionally save per-model predictions
-            if args.save_per_model_preds:
-                base_dir = per_model_output_root if per_model_output_root is not None else output_dir / 'per_model'
-                for m_idx, m_pred in enumerate(model_predictions):
-                    m_dir = base_dir / f'model_{m_idx}'
+            # Predict each model sequentially, save, then fuse
+            model_predictions = []
+            for idx, model in enumerate(models):
+                print(f"\n[Image {img_num}] Running model {idx+1}/{len(models)}")
+                model_pred = predict_single_model(
+                    model,
+                    image,
+                    device,
+                    patch_size=tuple(args.patch_size),
+                    overlap=args.overlap,
+                    patch_batch_size=args.patch_batch_size,
+                    use_amp=args.amp,
+                )
+                log_stats(f"Model {idx} pred stats", model_pred)
+                model_predictions.append(model_pred)
+
+                # Save per-model prediction (optional)
+                if per_model_output_root is not None:
+                    seed = getattr(model, "_ensemble_seed", None)
+                    model_dir = f"seed_{seed}" if isinstance(seed, int) else f"model_{idx}"
+                    m_dir = per_model_output_root / model_dir
                     m_dir.mkdir(parents=True, exist_ok=True)
                     m_path = m_dir / f'pred_{img_num}.nii.gz'
-                    m_pred_to_save = prepare_for_saving(m_pred)
-                    m_nifti = nib.Nifti1Image(m_pred_to_save, img_nifti.affine, img_nifti.header)
+                    m_pred_to_save = prepare_for_saving(model_pred)
+                    m_nifti = nib.Nifti1Image(m_pred_to_save, img_nifti.affine, img_nifti.header.copy())
                     nib.save(m_nifti, str(m_path))
+
+            # Fuse mean and STAPLE, already lung-masked
+            prediction_mean = np.mean(model_predictions, axis=0)
+            prediction_staple = fuse_predictions(
+                model_predictions, method="staple", threshold=args.threshold
+            )
+            log_stats("Ensemble mean", prediction_mean)
+            log_stats("Ensemble STAPLE", prediction_staple)
+
+            # Save prediction (ensemble)
+            mean_to_save = prepare_for_saving(prediction_mean)
+            pred_nifti = nib.Nifti1Image(mean_to_save, img_nifti.affine, img_nifti.header.copy())
+            pred_path = mean_output_dir / f'pred_{img_num}.nii.gz'
+            nib.save(pred_nifti, str(pred_path))
+
+            staple_to_save = prepare_for_saving(prediction_staple)
+            staple_nifti = nib.Nifti1Image(staple_to_save, img_nifti.affine, img_nifti.header.copy())
+            staple_path = staple_output_dir / f'pred_{img_num}.nii.gz'
+            nib.save(staple_nifti, str(staple_path))
             
             if not compute_metrics:
                 continue
@@ -510,12 +769,11 @@ def predict_on_dataset(args):
             # Calculate Dice score if label exists
             label_file = labels_dir / f'label_{img_num}.nii.gz'
             if label_file.exists():
-                label_nifti = nib.load(str(label_file))
-                label = label_nifti.get_fdata().astype(np.float32)
+                label = load_label_resampled(label_file, img_file, image.shape)
                 
                 label_skeleton = None
                 ensemble_dice, ensemble_cldice, label_skeleton = calculate_metrics(
-                    prediction, label, threshold=args.threshold, target_skeleton=None
+                    prediction_mean, label, threshold=args.threshold, target_skeleton=None
                 )
                 ensemble_metrics["dice"].append(ensemble_dice)
                 ensemble_metrics["cldice"].append(ensemble_cldice)
@@ -623,6 +881,8 @@ def predict_on_dataset(args):
             print(f"clDice bar plot saved to: {cldice_plot_path}")
     
     print(f"\nPredictions saved to: {output_dir}")
+    print(f"Mean outputs:    {mean_output_dir}")
+    print(f"STAPLE outputs:  {staple_output_dir}")
 
 
 def main():
@@ -632,16 +892,77 @@ def main():
     )
     
     # Model parameters
-    parser.add_argument('--checkpoint_dir', type=str, required=True,
-                        help='Directory containing trained ensemble models')
+    parser.add_argument(
+        '--checkpoint_template',
+        type=str,
+        default=(
+            '/projectnb/ec500kb/projects/Fall_2025_Projects/vessel_seg/'
+            'Dataset001_nnunet/seed_{seed}/Dataset001_nnunet/'
+            'nnUNetTrainer__nnUNetPlans__3d_fullres/fold_0/checkpoint_best.pth'
+        ),
+        help="Template path to checkpoints; must include '{seed}' placeholder (1..num_models).",
+    )
     parser.add_argument('--num_models', type=int, default=10,
                         help='Number of models in the ensemble')
+    parser.add_argument(
+        '--fold',
+        type=int,
+        default=0,
+        help='Fold index used within each seed directory (e.g., fold_0)',
+    )
     
     # Data parameters
     parser.add_argument('--data_dir', type=str, default='./data',
-                        help='Path to data directory')
-    parser.add_argument('--output_dir', type=str, default='./results/predictions_ensemble',
-                        help='Path to save predictions')
+                        help='Path to data directory (unused for labels; kept for compatibility)')
+    parser.add_argument(
+        '--images_dir',
+        type=str,
+        default='./data_preproc/images_iso',
+        help='Path to isotropic input images (NIfTI).',
+    )
+    parser.add_argument(
+        '--orig_images_dir',
+        type=str,
+        default='./data/images',
+        help='Path to original-resolution images (NIfTI).',
+    )
+    parser.add_argument(
+        '--image_source',
+        type=str,
+        choices=['iso', 'orig'],
+        default='iso',
+        help="Select which images to use: 'iso' (default, data_preproc/images_iso) or 'orig' (data/images).",
+    )
+    parser.add_argument(
+        '--labels_dir',
+        type=str,
+        default='./data_preproc/labels_iso',
+        help='Path to ground-truth labels (NIfTI) used when --image_source=iso.',
+    )
+    parser.add_argument(
+        '--orig_labels_dir',
+        type=str,
+        default='./data/labels',
+        help='Path to ground-truth labels for original-resolution images.',
+    )
+    parser.add_argument(
+        '--mean_output_dir',
+        type=str,
+        default='/projectnb/ec500kb/projects/Fall_2025_Projects/vessel_seg/data/unet_prediction/mean',
+        help='Path to save mean-averaged ensemble predictions',
+    )
+    parser.add_argument(
+        '--staple_output_dir',
+        type=str,
+        default='/projectnb/ec500kb/projects/Fall_2025_Projects/vessel_seg/data/unet_prediction/staple',
+        help='Path to save STAPLE-fused ensemble predictions',
+    )
+    parser.add_argument(
+        '--lung_mask_dir',
+        type=str,
+        default='data/lung_mask',
+        help='Directory containing lung masks named lung_mask_XXX.nii.gz',
+    )
     parser.add_argument('--image_list', type=str, action='append', default=None,
                         help='Optional text file(s) with image ids to process; pass multiple times for train/test/all')
     
@@ -652,20 +973,28 @@ def main():
                         help='Overlap ratio between patches (0-1)')
     parser.add_argument('--threshold', type=float, default=0.5,
                         help='Threshold for binary segmentation')
-    parser.add_argument('--fusion_method', type=str, default='mean', choices=['mean', 'staple'],
-                        help="How to fuse model predictions: 'mean' (default) or 'staple' (requires SimpleITK)")
-    parser.add_argument('--patch_batch_size', type=int, default=1,
-                        help='Number of patches to forward simultaneously during inference')
+    parser.add_argument('--patch_batch_size', type=int, default=4,
+                        help='Number of patches to forward simultaneously during inference (raise to use more GPU memory)')
     parser.add_argument('--amp', action='store_true',
                         help='Enable mixed-precision (autocast) inference on CUDA')
-    parser.add_argument('--save_per_model_preds', action='store_true',
-                        help='Save each model\'s prediction as NIfTI (defaults to output_dir/per_model/model_i)')
-    parser.add_argument('--per_model_output_root', type=str, default='./data/unet_prediction',
-                        help='Base directory for per-model predictions (default: ./data/unet_prediction)')
-    parser.add_argument('--ensemble_output_root', type=str, default='./data/unet_prediction/ensemble',
-                        help='Additional directory to save ensemble predictions (default: ./data/unet_prediction/ensemble)')
-    parser.add_argument('--binarize_saved_outputs', action='store_true',
-                        help='Binarize saved predictions using --threshold (useful to store label masks)')
+    parser.add_argument(
+        '--save_per_model_preds',
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help='Save each individual model prediction volume under --per_model_output_root.',
+    )
+    parser.add_argument(
+        '--per_model_output_root',
+        type=str,
+        default=None,
+        help="Base directory for per-model predictions (default: <mean_output_dir>/per_model).",
+    )
+    parser.add_argument(
+        '--binarize_saved_outputs',
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help='Binarize saved predictions using --threshold (use --no-binarize_saved_outputs to save probabilities).',
+    )
     parser.add_argument('--skip_metrics', action='store_true',
                         help='Skip Dice/clDice computation and CSV logging')
     parser.add_argument('--resume', action='store_true',
