@@ -3,7 +3,7 @@ Note that we use the given data structure to deploy it:
 
 -data\
 -- images\
--- labels\
+-- labels
 
 You can access our conda environment and exccute code with the following steps directly:
 
@@ -51,8 +51,6 @@ singularity run --nv my-app.sif \
 
 ** Again, we use the given data structure. So make sure your data is organized as:
 
--data_testing (changed to your folder name)
-
--- images
-
+-data_testing (changed to your folder name)\
+-- images\
 -- labels
