@@ -1,8 +1,9 @@
 #  Prediction
 Note that we use the given data structure to deploy it:
--data
--- images
--- labels
+
+-data\
+-- images\
+-- labels\
 
 You can access our conda environment and exccute code with the following steps directly:
 
