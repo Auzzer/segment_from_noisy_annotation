@@ -48,7 +48,7 @@ singularity run --nv my-app.sif \
   --data_dir /projectnb/ec500kb/projects/Fall_2025_Projects/vessel_seg/data_testing \
   --output_dir /projectnb/ec500kb/projects/Fall_2025_Projects/vessel_seg/data/mtcl_lungmasked
 
-** Again, we use the given data structure. So make sure your data is organized as:
--data_testing changed to your folder name
--- images
--- labels
+** Again, we use the given data structure. So make sure your data is organized as:\\
+-data_testing (changed to your folder name)\\ 
+-- images\\
+-- labels\\
